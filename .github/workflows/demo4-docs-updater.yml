@@ -64,15 +64,15 @@ jobs:
           echo "✅ Found ${CHANGE_COUNT} code file(s) changed"
           cat code_changes.txt
           
-          # Get full diff
+          # Get full diff (use xargs to safely pass filenames)
           if git rev-parse HEAD^ > /dev/null 2>&1; then
-            git diff HEAD^ HEAD -- $(cat code_changes.txt) > code_changes.diff
-            ADDITIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$1} END {print sum+0}')
-            DELETIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$2} END {print sum+0}')
+            cat code_changes.txt | xargs git diff HEAD^ HEAD -- > code_changes.diff
+            ADDITIONS=$(git diff HEAD^ HEAD --numstat -- $(cat code_changes.txt) | awk '{sum+=$1} END {print sum+0}')
+            DELETIONS=$(git diff HEAD^ HEAD --numstat -- $(cat code_changes.txt) | awk '{sum+=$2} END {print sum+0}')
           else
-            git show HEAD -- $(cat code_changes.txt) > code_changes.diff
-            ADDITIONS=$(git diff-tree --no-commit-id --numstat -r HEAD | awk '{sum+=$1} END {print sum+0}')
-            DELETIONS=$(git diff-tree --no-commit-id --numstat -r HEAD | awk '{sum+=$2} END {print sum+0}')
+            cat code_changes.txt | xargs git show HEAD -- > code_changes.diff
+            ADDITIONS=$(cat code_changes.txt | xargs git diff-tree --no-commit-id --numstat -r HEAD -- | awk '{sum+=$1} END {print sum+0}')
+            DELETIONS=$(cat code_changes.txt | xargs git diff-tree --no-commit-id --numstat -r HEAD -- | awk '{sum+=$1} END {print sum+0}')
           fi
           
           echo "additions=${ADDITIONS}" >> $GITHUB_OUTPUT
