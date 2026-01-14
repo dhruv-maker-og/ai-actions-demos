@@ -1,0 +1,209 @@
+name: "Demo 2: Automatic Release Notes Generator"
+
+# Manually triggered workflow with inputs
+on:
+  workflow_dispatch:
+    inputs:
+      since_date:
+        description: 'Start date for PRs (YYYY-MM-DD)'
+        required: true
+        type: string
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: write        # To create releases
+  pull-requests: read    # To read PR information
+
+jobs:
+  generate-release-notes:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for accurate PR data
+
+      - name: Setup GitHub CLI
+        run: |
+          # GitHub CLI is pre-installed on ubuntu-latest
+          gh --version
+          echo "✅ GitHub CLI ready"
+
+      - name: Fetch merged pull requests
+        id: fetch-prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📥 Fetching merged PRs since ${{ inputs.since_date }}..."
+          
+          # Fetch merged PRs using GitHub CLI
+          gh pr list \
+            --repo ${{ github.repository }} \
+            --state merged \
+            --base ${{ inputs.target_branch }} \
+            --limit 100 \
+            --json number,title,body,author,mergedAt,labels,url \
+            > all_prs.json
+          
+          # Filter PRs by date
+          cat all_prs.json | jq --arg since "${{ inputs.since_date }}" \
+            '[.[] | select(.mergedAt >= $since)]' > filtered_prs.json
+          
+          PR_COUNT=$(cat filtered_prs.json | jq 'length')
+          echo "pr_count=${PR_COUNT}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Found ${PR_COUNT} merged PRs since ${{ inputs.since_date }}"
+          
+          # Create a formatted list for the AI
+          cat filtered_prs.json | jq -r '.[] | 
+            "PR #\(.number): \(.title)\n  Author: @\(.author.login)\n  URL: \(.url)\n  Labels: \(.labels | map(.name) | join(", "))\n  Description: \(.body // "No description")\n"' \
+            > pr_list.txt
+          
+          echo "📄 PR list prepared for AI analysis"
+
+      - name: Generate release notes with AI
+        if: steps.fetch-prs.outputs.pr_count > 0
+        id: ai-generate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🤖 Generating release notes with AI..."
+          
+          # Read PR list
+          PR_LIST=$(cat pr_list.txt)
+          
+          # Prepare prompt
+          PROMPT="You are a release notes generator. Create professional, well-organized release notes from the following merged pull requests.
+
+          Release Version: ${{ inputs.version }}
+          Date Range: Since ${{ inputs.since_date }}
+
+          Pull Requests:
+          ${PR_LIST}
+
+          Instructions:
+          1. Group PRs into categories: Features ✨, Bug Fixes 🐛, Documentation 📚, Performance ⚡, Other
+          2. Use clear, user-friendly language
+          3. Format as Markdown with proper headings
+          4. Include PR numbers and authors
+          5. Highlight breaking changes if any
+          6. Keep descriptions concise but informative
+          7. Use emojis for visual appeal
+
+          Format:
+          ## What's New in ${{ inputs.version }}
+
+          ### ✨ Features
+          - Feature description (#PR) by @author
+
+          ### 🐛 Bug Fixes
+          - Fix description (#PR) by @author
+
+          ### 📚 Documentation
+          - Doc improvement (#PR) by @author
+
+          ### ⚡ Performance
+          - Performance improvement (#PR) by @author
+
+          ### 🔧 Other Changes
+          - Other change (#PR) by @author
+
+          ## Contributors
+          Thanks to all contributors!
+
+          Generate professional release notes following this format."
+          
+          # Call GitHub Models API
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            https://models.inference.ai.azure.com/chat/completions \
+            -d "{
+              \"model\": \"gpt-4o-mini\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a professional technical writer creating release notes.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": $(echo "$PROMPT" | jq -Rs .)
+                }
+              ],
+              \"temperature\": 0.7,
+              \"max_tokens\": 2000
+            }")
+          
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ API Error: $(echo "$RESPONSE" | jq -r '.error.message')"
+            exit 1
+          fi
+          
+          # Extract release notes
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' > release_notes.md
+          
+          echo "✅ Release notes generated"
+          echo ""
+          echo "Preview:"
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        if: steps.fetch-prs.outputs.pr_count > 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🚀 Creating GitHub Release ${{ inputs.version }}..."
+          
+          # Create release with AI-generated notes
+          gh release create "${{ inputs.version }}" \
+            --repo ${{ github.repository }} \
+            --title "${{ inputs.version }}" \
+            --notes-file release_notes.md \
+            --target ${{ inputs.target_branch }}
+          
+          echo "✅ Release ${{ inputs.version }} created successfully!"
+          echo ""
+          echo "🔗 View at: https://github.com/${{ github.repository }}/releases/tag/${{ inputs.version }}"
+
+      - name: Handle no PRs case
+        if: steps.fetch-prs.outputs.pr_count == 0
+        run: |
+          echo "⚠️  No merged PRs found since ${{ inputs.since_date }}"
+          echo "Cannot create release notes without any changes."
+          exit 1
+
+      - name: Upload release notes artifact
+        if: steps.fetch-prs.outputs.pr_count > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-${{ inputs.version }}
+          path: |
+            release_notes.md
+            pr_list.txt
+            filtered_prs.json
+          retention-days: 90
+
+      - name: Summary
+        if: steps.fetch-prs.outputs.pr_count > 0
+        run: |
+          echo "### 🎉 Release Notes Generated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **PRs Included**: ${{ steps.fetch-prs.outputs.pr_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date Range**: Since ${{ inputs.since_date }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Release Notes Preview" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat release_notes.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View Release](https://github.com/${{ github.repository }}/releases/tag/${{ inputs.version }})" >> $GITHUB_STEP_SUMMARY

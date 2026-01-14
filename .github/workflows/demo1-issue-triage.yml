@@ -1,0 +1,181 @@
+name: "Demo 1: AI-Driven Issue Triage"
+
+# Triggers when a new issue is opened
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write  # Required to comment on issues
+
+jobs:
+  triage-issue:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Extract issue information
+        id: issue-info
+        run: |
+          # Extract issue details from GitHub context
+          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
+          echo "ISSUE_TITLE=${{ github.event.issue.title }}" >> $GITHUB_ENV
+          
+          # Save issue body to file to handle multiline content
+          cat << 'EOF' > issue_body.txt
+          ${{ github.event.issue.body }}
+          EOF
+          
+          echo "✅ Extracted issue #${{ github.event.issue.number }}"
+
+      - name: Analyze issue with AI
+        id: ai-analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Read issue body
+          ISSUE_BODY=$(cat issue_body.txt)
+          
+          # Prepare prompt for AI
+          PROMPT="You are a GitHub issue triage assistant. Analyze the following issue and determine if it contains enough information for a maintainer to act on it.
+
+          Issue Title: ${ISSUE_TITLE}
+          Issue Body:
+          ${ISSUE_BODY}
+
+          Check for:
+          1. Clear problem description or feature request
+          2. Steps to reproduce (if it's a bug)
+          3. Expected vs actual behavior (if applicable)
+          4. Environment details (if relevant)
+          5. Sufficient context to understand the request
+
+          Respond in JSON format:
+          {
+            \"is_complete\": true or false,
+            \"issue_type\": \"bug\" or \"feature\" or \"question\" or \"documentation\",
+            \"missing_elements\": [\"list of missing items\"],
+            \"suggested_labels\": [\"label1\", \"label2\"],
+            \"friendly_feedback\": \"A helpful message to the user explaining what's missing\"
+          }
+
+          Be encouraging and friendly in your feedback. Focus on being helpful, not critical."
+          
+          # Call GitHub Models API
+          echo "🤖 Calling AI to analyze issue..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            https://models.inference.ai.azure.com/chat/completions \
+            -d "{
+              \"model\": \"gpt-4o-mini\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a helpful GitHub issue triage assistant. Always respond with valid JSON.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": $(echo "$PROMPT" | jq -Rs .)
+                }
+              ],
+              \"temperature\": 0.3,
+              \"max_tokens\": 1000
+            }")
+          
+          # Check if API call was successful
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ API Error: $(echo "$RESPONSE" | jq -r '.error.message')"
+            exit 1
+          fi
+          
+          # Extract AI response
+          AI_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          echo "$AI_CONTENT" > ai_response.json
+          
+          echo "✅ AI analysis complete"
+          cat ai_response.json | jq .
+          
+          # Parse results
+          IS_COMPLETE=$(echo "$AI_CONTENT" | jq -r '.is_complete')
+          ISSUE_TYPE=$(echo "$AI_CONTENT" | jq -r '.issue_type')
+          FEEDBACK=$(echo "$AI_CONTENT" | jq -r '.friendly_feedback')
+          LABELS=$(echo "$AI_CONTENT" | jq -r '.suggested_labels | join(",")')
+          
+          # Set outputs
+          echo "is_complete=${IS_COMPLETE}" >> $GITHUB_OUTPUT
+          echo "issue_type=${ISSUE_TYPE}" >> $GITHUB_OUTPUT
+          echo "labels=${LABELS}" >> $GITHUB_OUTPUT
+          
+          # Save feedback to file for next step
+          echo "$FEEDBACK" > feedback.txt
+
+      - name: Comment if issue is incomplete
+        if: steps.ai-analysis.outputs.is_complete == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FEEDBACK=$(cat feedback.txt)
+          
+          # Create helpful comment
+          COMMENT="👋 Thanks for opening this issue!
+
+          🤖 **AI Triage Assistant**: Our automated triage system has reviewed your issue and noticed it could use some additional information.
+
+          ${FEEDBACK}
+
+          **Why does this matter?**
+          More details help maintainers understand and address your issue faster! ⚡
+
+          Feel free to edit your issue to add the missing information. Thanks! 🙏"
+          
+          # Post comment using GitHub CLI
+          echo "$COMMENT" | gh issue comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --body-file -
+          
+          echo "✅ Posted feedback comment on issue #${{ github.event.issue.number }}"
+
+      - name: Add suggested labels
+        if: steps.ai-analysis.outputs.labels != '' && steps.ai-analysis.outputs.labels != 'null'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LABELS="${{ steps.ai-analysis.outputs.labels }}"
+          
+          # Add labels (comma-separated)
+          IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
+          for label in "${LABEL_ARRAY[@]}"; do
+            # Try to add label, ignore if it doesn't exist
+            gh issue edit ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --add-label "$label" 2>/dev/null || echo "⚠️  Label '$label' doesn't exist, skipping"
+          done
+          
+          echo "✅ Added suggested labels: $LABELS"
+
+      - name: Add triage label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Add a 'needs-triage' label to track AI-triaged issues
+          gh issue edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --add-label "ai-triaged" 2>/dev/null || echo "⚠️  'ai-triaged' label doesn't exist"
+          
+          echo "✅ Triage complete for issue #${{ github.event.issue.number }}"
+
+      - name: Summary
+        run: |
+          echo "### 🎯 Issue Triage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Issue**: #${{ github.event.issue.number }} - ${{ github.event.issue.title }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Complete**: ${{ steps.ai-analysis.outputs.is_complete }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type**: ${{ steps.ai-analysis.outputs.issue_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Labels**: ${{ steps.ai-analysis.outputs.labels }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.ai-analysis.outputs.is_complete }}" == "false" ]; then
+            echo "✉️ Posted feedback comment requesting additional information" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Issue looks complete and ready for review!" >> $GITHUB_STEP_SUMMARY
+          fi

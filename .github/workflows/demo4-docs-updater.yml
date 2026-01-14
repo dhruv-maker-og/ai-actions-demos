@@ -1,0 +1,308 @@
+name: "Demo 4: Documentation Auto-Updater (Project Bloom)"
+
+# Triggers when code changes are pushed to src/ directory
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'api/**'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # To commit documentation updates
+
+jobs:
+  update-documentation:
+    runs-on: ubuntu-latest
+    
+    # Prevent infinite loops - don't run if only docs changed
+    if: |
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, 'docs:')
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need previous commit for diff
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "✅ Git configured for automated commits"
+
+      - name: Analyze code changes
+        id: analyze-changes
+        run: |
+          echo "🔍 Analyzing code changes..."
+          
+          # Get list of changed files
+          git diff HEAD^ HEAD --name-only > changed_files.txt
+          
+          # Filter for source code files only
+          grep -E '\.(py|js|ts|java|go|rs|cpp|c|h|rb)$' changed_files.txt > code_changes.txt || true
+          
+          CHANGE_COUNT=$(wc -l < code_changes.txt | tr -d ' ')
+          echo "change_count=${CHANGE_COUNT}" >> $GITHUB_OUTPUT
+          
+          if [ "$CHANGE_COUNT" -eq "0" ]; then
+            echo "⚠️  No code changes detected"
+            exit 0
+          fi
+          
+          echo "✅ Found ${CHANGE_COUNT} code file(s) changed"
+          cat code_changes.txt
+          
+          # Get full diff
+          git diff HEAD^ HEAD -- $(cat code_changes.txt) > code_changes.diff
+          
+          # Get summary statistics
+          ADDITIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$1} END {print sum+0}')
+          DELETIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$2} END {print sum+0}')
+          
+          echo "additions=${ADDITIONS}" >> $GITHUB_OUTPUT
+          echo "deletions=${DELETIONS}" >> $GITHUB_OUTPUT
+          
+          echo "📊 Changes: +${ADDITIONS} -${DELETIONS}"
+
+      - name: Identify relevant documentation
+        id: find-docs
+        if: steps.analyze-changes.outputs.change_count > 0
+        run: |
+          echo "📚 Finding relevant documentation files..."
+          
+          # Check if docs directory exists
+          if [ ! -d "docs" ]; then
+            mkdir -p docs
+            echo "# Documentation" > docs/README.md
+            echo "📝 Created docs directory"
+          fi
+          
+          # List all documentation files
+          find docs -type f -name "*.md" > doc_files.txt || echo "docs/README.md" > doc_files.txt
+          
+          DOC_COUNT=$(wc -l < doc_files.txt | tr -d ' ')
+          echo "doc_count=${DOC_COUNT}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Found ${DOC_COUNT} documentation file(s)"
+          cat doc_files.txt
+
+      - name: Load documentation update prompt
+        id: load-prompt
+        run: |
+          # Read custom prompt template
+          if [ -f ".github/prompts/docs-update-prompt.txt" ]; then
+            cat .github/prompts/docs-update-prompt.txt > prompt_template.txt
+            echo "✅ Loaded custom documentation prompt"
+          else
+            # Default prompt
+            cat << 'EOF' > prompt_template.txt
+          You are a technical documentation specialist. Your task is to update documentation to reflect code changes.
+
+          Guidelines:
+          1. Maintain the existing documentation style and tone
+          2. Be precise and accurate
+          3. Update only sections affected by the code changes
+          4. Preserve all other content unchanged
+          5. Use clear, concise language
+          6. Include code examples if relevant
+          7. Update version numbers or dates if present
+          EOF
+            echo "⚠️  Using default prompt (custom file not found)"
+          fi
+
+      - name: Read current documentation
+        if: steps.analyze-changes.outputs.change_count > 0
+        run: |
+          echo "📖 Reading current documentation..."
+          
+          # Combine all documentation into one context file
+          echo "=== CURRENT DOCUMENTATION ===" > current_docs.txt
+          echo "" >> current_docs.txt
+          
+          while IFS= read -r doc_file; do
+            if [ -f "$doc_file" ]; then
+              echo "--- File: $doc_file ---" >> current_docs.txt
+              cat "$doc_file" >> current_docs.txt
+              echo -e "\n" >> current_docs.txt
+            fi
+          done < doc_files.txt
+          
+          echo "✅ Documentation context prepared"
+
+      - name: Generate documentation updates with AI
+        if: steps.analyze-changes.outputs.change_count > 0
+        id: ai-update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🤖 Generating documentation updates with AI..."
+          
+          # Read all context
+          PROMPT_TEMPLATE=$(cat prompt_template.txt)
+          CURRENT_DOCS=$(cat current_docs.txt | head -c 10000)  # Limit to prevent token overflow
+          CODE_DIFF=$(cat code_changes.diff | head -c 5000)     # Limit diff size
+          CHANGED_FILES=$(cat code_changes.txt | tr '\n' ', ')
+          
+          # Build complete prompt
+          FULL_PROMPT="${PROMPT_TEMPLATE}
+
+          **Context:**
+          - Repository: ${{ github.repository }}
+          - Commit: ${{ github.sha }}
+          - Author: ${{ github.event.head_commit.author.name }}
+          - Commit Message: ${{ github.event.head_commit.message }}
+
+          **Changed Files:**
+          ${CHANGED_FILES}
+
+          **Code Changes (diff):**
+          \`\`\`diff
+          ${CODE_DIFF}
+          \`\`\`
+
+          **Current Documentation:**
+          ${CURRENT_DOCS}
+
+          **Task:**
+          Based on the code changes above, update the documentation appropriately. Return ONLY the updated documentation content for docs/README.md in Markdown format. Maintain the existing structure and style. Focus on documenting what changed, why it matters, and how to use any new features."
+          
+          # Call GitHub Models API
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            https://models.inference.ai.azure.com/chat/completions \
+            -d "{
+              \"model\": \"gpt-4o-mini\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a technical documentation writer. Produce clear, accurate, and well-structured documentation.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": $(echo "$FULL_PROMPT" | jq -Rs .)
+                }
+              ],
+              \"temperature\": 0.3,
+              \"max_tokens\": 3000
+            }")
+          
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ API Error: $(echo "$RESPONSE" | jq -r '.error.message')"
+            exit 1
+          fi
+          
+          # Extract updated documentation
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' > updated_docs.md
+          
+          echo "✅ Documentation updates generated"
+
+      - name: Apply documentation updates
+        if: steps.analyze-changes.outputs.change_count > 0
+        id: apply-updates
+        run: |
+          echo "✍️  Applying documentation updates..."
+          
+          # Backup current docs
+          cp docs/README.md docs/README.md.backup 2>/dev/null || true
+          
+          # Apply updates to main README
+          cp updated_docs.md docs/README.md
+          
+          # Check if anything actually changed
+          if git diff --quiet docs/; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No documentation changes needed"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Documentation updated"
+            
+            # Show what changed
+            echo "📝 Documentation diff:"
+            git diff docs/
+          fi
+
+      - name: Commit and push changes
+        if: steps.apply-updates.outputs.has_changes == 'true'
+        run: |
+          echo "💾 Committing documentation updates..."
+          
+          # Stage documentation changes
+          git add docs/
+          
+          # Create commit with detailed message
+          cat << EOF > commit_message.txt
+          docs: Auto-update from code changes [skip ci]
+
+          Updated documentation to reflect code changes in commit ${{ github.sha }}
+
+          Changed files:
+          $(cat code_changes.txt | sed 's/^/- /')
+
+          Changes: +${{ steps.analyze-changes.outputs.additions }} -${{ steps.analyze-changes.outputs.deletions }}
+
+          Generated by: Demo 4 - Documentation Auto-Updater
+          Triggered by: ${{ github.event.head_commit.author.name }}
+          Original commit: ${{ github.event.head_commit.message }}
+          EOF
+          
+          git commit -F commit_message.txt
+          
+          # Push changes
+          git push origin ${{ github.ref_name }}
+          
+          echo "✅ Documentation updates pushed successfully"
+
+      - name: Create summary comment
+        if: steps.apply-updates.outputs.has_changes == 'true'
+        run: |
+          echo "📊 Creating summary..."
+          
+          # Find related issues/PRs (simple heuristic)
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          if echo "$COMMIT_MSG" | grep -qoE '#[0-9]+'; then
+            ISSUE_NUMBER=$(echo "$COMMIT_MSG" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+            echo "Related to issue/PR #${ISSUE_NUMBER}"
+          fi
+
+      - name: Upload artifacts
+        if: steps.analyze-changes.outputs.change_count > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation-updates-${{ github.run_number }}
+          path: |
+            updated_docs.md
+            code_changes.diff
+            current_docs.txt
+            docs/README.md.backup
+          retention-days: 30
+
+      - name: Summary
+        if: steps.analyze-changes.outputs.change_count > 0
+        run: |
+          echo "### 📚 Documentation Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changed Files**: ${{ steps.analyze-changes.outputs.change_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Code Changes**: +${{ steps.analyze-changes.outputs.additions }} -${{ steps.analyze-changes.outputs.deletions }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Documentation Files**: ${{ steps.find-docs.outputs.doc_count }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.apply-updates.outputs.has_changes }}" == "true" ]; then
+            echo "- **Status**: ✅ Documentation updated and committed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📝 Documentation Changes" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```diff' >> $GITHUB_STEP_SUMMARY
+            git diff HEAD^ docs/README.md | head -50 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: ℹ️  No documentation updates needed" >> $GITHUB_STEP_SUMMARY
+          fi

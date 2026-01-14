@@ -1,0 +1,240 @@
+name: "Demo 3: Weekly AI Summary of Open Issues"
+
+# Runs every Monday at 9 AM UTC, or can be manually triggered
+on:
+  schedule:
+    - cron: '0 9 * * MON'  # Every Monday at 9:00 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  issues: write  # Create summary issue and add labels
+
+jobs:
+  weekly-issue-summary:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch all open issues
+        id: fetch-issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📥 Fetching all open issues..."
+          
+          # Fetch open issues with details
+          gh issue list \
+            --repo ${{ github.repository }} \
+            --state open \
+            --limit 100 \
+            --json number,title,body,labels,createdAt,updatedAt,comments,author,url \
+            > open_issues.json
+          
+          ISSUE_COUNT=$(cat open_issues.json | jq 'length')
+          echo "issue_count=${ISSUE_COUNT}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Found ${ISSUE_COUNT} open issues"
+          
+          # Create formatted list for AI (respecting token limits)
+          cat open_issues.json | jq -r '.[] | 
+            "Issue #\(.number): \(.title)\n  Created: \(.createdAt | split("T")[0])\n  Updated: \(.updatedAt | split("T")[0])\n  Author: @\(.author.login)\n  Comments: \(.comments)\n  Labels: \(.labels | map(.name) | join(", "))\n  URL: \(.url)\n  Description: \(.body // "No description" | .[0:300])...\n"' \
+            > issue_list.txt
+          
+          # Calculate staleness
+          CURRENT_DATE=$(date -u +"%Y-%m-%d")
+          echo "current_date=${CURRENT_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Load custom prompt template
+        id: load-prompt
+        run: |
+          # Read the external prompt file
+          if [ -f ".github/prompts/weekly-summary-prompt.txt" ]; then
+            CUSTOM_PROMPT=$(cat .github/prompts/weekly-summary-prompt.txt)
+            echo "✅ Loaded custom prompt template"
+          else
+            # Default prompt if file doesn't exist
+            CUSTOM_PROMPT="Analyze these open issues and create a weekly summary with prioritization."
+            echo "⚠️  Using default prompt (custom prompt file not found)"
+          fi
+          
+          # Save to file for next step
+          echo "$CUSTOM_PROMPT" > prompt_template.txt
+
+      - name: Generate AI summary
+        if: steps.fetch-issues.outputs.issue_count > 0
+        id: ai-summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🤖 Generating AI-powered issue summary..."
+          
+          # Read data
+          ISSUE_LIST=$(cat issue_list.txt)
+          PROMPT_TEMPLATE=$(cat prompt_template.txt)
+          ISSUE_COUNT=${{ steps.fetch-issues.outputs.issue_count }}
+          CURRENT_DATE=${{ steps.fetch-issues.outputs.current_date }}
+          
+          # Build complete prompt
+          FULL_PROMPT="${PROMPT_TEMPLATE}
+
+          Current Date: ${CURRENT_DATE}
+          Total Open Issues: ${ISSUE_COUNT}
+
+          Issue List:
+          ${ISSUE_LIST}
+
+          Please provide a comprehensive weekly summary in Markdown format with:
+          1. Executive Summary (3-4 sentences)
+          2. Priority Issues (Top 5 that need immediate attention)
+          3. Issues by Theme (group related issues)
+          4. Stale Issues (not updated in >30 days)
+          5. New Issues This Week
+          6. Recommended Actions
+
+          Use emojis and clear formatting. Be specific and actionable."
+          
+          # Call GitHub Models API
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            https://models.inference.ai.azure.com/chat/completions \
+            -d "{
+              \"model\": \"gpt-4o-mini\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a project manager creating weekly issue summaries. Be concise, actionable, and insightful.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": $(echo "$FULL_PROMPT" | jq -Rs .)
+                }
+              ],
+              \"temperature\": 0.5,
+              \"max_tokens\": 2500
+            }")
+          
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+            echo "❌ API Error: $(echo "$RESPONSE" | jq -r '.error.message')"
+            exit 1
+          fi
+          
+          # Extract summary
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' > ai_summary.md
+          
+          echo "✅ AI summary generated"
+          echo ""
+          echo "Preview:"
+          head -20 ai_summary.md
+
+      - name: Create summary issue
+        if: steps.fetch-issues.outputs.issue_count > 0
+        id: create-issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📝 Creating summary issue..."
+          
+          # Get current week number and date
+          WEEK_NUMBER=$(date -u +"%V")
+          CURRENT_DATE=$(date -u +"%Y-%m-%d")
+          YEAR=$(date -u +"%Y")
+          
+          # Prepare issue body with header
+          cat << EOF > final_summary.md
+          # 📊 Weekly Issue Summary - Week ${WEEK_NUMBER}, ${YEAR}
+          
+          **Generated**: ${CURRENT_DATE}
+          **Total Open Issues**: ${{ steps.fetch-issues.outputs.issue_count }}
+          **Generated by**: AI-powered workflow
+          
+          ---
+          
+          EOF
+          
+          # Append AI-generated content
+          cat ai_summary.md >> final_summary.md
+          
+          # Add footer
+          cat << EOF >> final_summary.md
+          
+          ---
+          
+          *This summary was automatically generated by AI. Please review and adjust priorities as needed.*
+          
+          **Next Steps**:
+          - [ ] Review priority issues
+          - [ ] Assign critical issues
+          - [ ] Close or update stale issues
+          - [ ] Plan upcoming sprint based on themes
+          
+          🤖 *Generated by [Demo 3: Weekly Issue Summary](.github/workflows/demo3-weekly-summary.yml)*
+          EOF
+          
+          # Create the issue
+          ISSUE_URL=$(gh issue create \
+            --repo ${{ github.repository }} \
+            --title "📊 Weekly Issue Summary - Week ${WEEK_NUMBER}, ${YEAR}" \
+            --body-file final_summary.md \
+            --label "weekly-summary,automation")
+          
+          echo "issue_url=${ISSUE_URL}" >> $GITHUB_OUTPUT
+          echo "✅ Summary issue created: ${ISSUE_URL}"
+
+      - name: Handle no issues case
+        if: steps.fetch-issues.outputs.issue_count == 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🎉 No open issues found! Creating celebration issue..."
+          
+          CURRENT_DATE=$(date -u +"%Y-%m-%d")
+          
+          gh issue create \
+            --repo ${{ github.repository }} \
+            --title "🎉 Weekly Summary - No Open Issues! (${CURRENT_DATE})" \
+            --body "**Congratulations!** 🎊
+
+          There are currently **no open issues** in this repository!
+
+          This is a great achievement. Consider:
+          - Reviewing closed issues for patterns
+          - Planning new features
+          - Improving documentation
+          - Preparing for the next release
+
+          *Generated by [Demo 3: Weekly Issue Summary](.github/workflows/demo3-weekly-summary.yml)*" \
+            --label "weekly-summary,automation"
+
+      - name: Upload summary artifact
+        if: steps.fetch-issues.outputs.issue_count > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-summary-${{ github.run_number }}
+          path: |
+            final_summary.md
+            ai_summary.md
+            issue_list.txt
+            open_issues.json
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          echo "### 📊 Weekly Issue Summary Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date**: $(date -u +"%Y-%m-%d")" >> $GITHUB_STEP_SUMMARY
+          echo "- **Open Issues**: ${{ steps.fetch-issues.outputs.issue_count }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.fetch-issues.outputs.issue_count }}" -gt "0" ]; then
+            echo "- **Summary Issue**: ${{ steps.create-issue.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📝 Summary Preview" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            head -30 final_summary.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🎉 No open issues - repository is in great shape!" >> $GITHUB_STEP_SUMMARY
+          fi

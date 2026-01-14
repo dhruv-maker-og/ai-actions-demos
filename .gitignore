@@ -1,0 +1,52 @@
+# Do not modify .gitignore - managed by template
+# Generated files
+*.pyc
+__pycache__/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary workflow files
+*_temp.json
+*_backup.*
+ai_response.json
+issue_body.txt
+feedback.txt
+prs.json
+filtered_prs.json
+pr_list.txt
+release_notes.md
+all_prs.json
+open_issues.json
+issue_list.txt
+prompt_template.txt
+ai_summary.md
+final_summary.md
+commit_message.txt
+changed_files.txt
+code_changes.txt
+code_changes.diff
+doc_files.txt
+current_docs.txt
+updated_docs.md
+
+# Node modules (if you expand to JS demos)
+node_modules/
+
+# Python virtual environments
+venv/
+env/
+ENV/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
