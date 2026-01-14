@@ -28,7 +28,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # Need previous commit for diff
+          fetch-depth: 0  # fetch full history so HEAD^ exists
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
