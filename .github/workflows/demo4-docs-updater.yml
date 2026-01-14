@@ -42,8 +42,13 @@ jobs:
         run: |
           echo "🔍 Analyzing code changes..."
           
-          # Get list of changed files
-          git diff HEAD^ HEAD --name-only > changed_files.txt
+          # Get list of changed files (handle first commit)
+          if git rev-parse HEAD^ > /dev/null 2>&1; then
+            git diff HEAD^ HEAD --name-only > changed_files.txt
+          else
+            # First commit - diff against empty tree
+            git diff-tree --no-commit-id --name-only -r HEAD > changed_files.txt
+          fi
           
           # Filter for source code files only
           grep -E '\.(py|js|ts|java|go|rs|cpp|c|h|rb)$' changed_files.txt > code_changes.txt || true
@@ -60,11 +65,15 @@ jobs:
           cat code_changes.txt
           
           # Get full diff
-          git diff HEAD^ HEAD -- $(cat code_changes.txt) > code_changes.diff
-          
-          # Get summary statistics
-          ADDITIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$1} END {print sum+0}')
-          DELETIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$2} END {print sum+0}')
+          if git rev-parse HEAD^ > /dev/null 2>&1; then
+            git diff HEAD^ HEAD -- $(cat code_changes.txt) > code_changes.diff
+            ADDITIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$1} END {print sum+0}')
+            DELETIONS=$(git diff HEAD^ HEAD --numstat | awk '{sum+=$2} END {print sum+0}')
+          else
+            git show HEAD -- $(cat code_changes.txt) > code_changes.diff
+            ADDITIONS=$(git diff-tree --no-commit-id --numstat -r HEAD | awk '{sum+=$1} END {print sum+0}')
+            DELETIONS=$(git diff-tree --no-commit-id --numstat -r HEAD | awk '{sum+=$2} END {print sum+0}')
+          fi
           
           echo "additions=${ADDITIONS}" >> $GITHUB_OUTPUT
           echo "deletions=${DELETIONS}" >> $GITHUB_OUTPUT
@@ -144,10 +153,10 @@ jobs:
         run: |
           echo "🤖 Generating documentation updates with AI..."
           
-          # Read all context
+          # Read all context (use line-based truncation to avoid UTF-8 issues)
           PROMPT_TEMPLATE=$(cat prompt_template.txt)
-          CURRENT_DOCS=$(cat current_docs.txt | head -c 10000)  # Limit to prevent token overflow
-          CODE_DIFF=$(cat code_changes.diff | head -c 5000)     # Limit diff size
+          CURRENT_DOCS=$(cat current_docs.txt | head -n 200)  # Limit to prevent token overflow
+          CODE_DIFF=$(cat code_changes.diff | head -n 150)     # Limit diff size
           CHANGED_FILES=$(cat code_changes.txt | tr '\n' ', ')
           
           # Build complete prompt
@@ -173,37 +182,81 @@ jobs:
           **Task:**
           Based on the code changes above, update the documentation appropriately. Return ONLY the updated documentation content for docs/README.md in Markdown format. Maintain the existing structure and style. Focus on documenting what changed, why it matters, and how to use any new features."
           
+          # Create JSON request file safely using jq
+          cat > request_base.json << 'EOFJ'
+          {
+            "model": "gpt-4o-mini",
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a technical documentation writer. Produce clear, accurate, and well-structured documentation."
+              },
+              {
+                "role": "user",
+                "content": ""
+              }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 3000
+          }
+          EOFJ
+          
+          # Insert prompt content safely using jq
+          jq --arg prompt "$FULL_PROMPT" '.messages[1].content = $prompt' request_base.json > request.json
+          
           # Call GitHub Models API
-          RESPONSE=$(curl -s -X POST \
+          echo "🌐 Calling GitHub Models API..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Content-Type: application/json" \
-            https://models.inference.ai.azure.com/chat/completions \
-            -d "{
-              \"model\": \"gpt-4o-mini\",
-              \"messages\": [
-                {
-                  \"role\": \"system\",
-                  \"content\": \"You are a technical documentation writer. Produce clear, accurate, and well-structured documentation.\"
-                },
-                {
-                  \"role\": \"user\",
-                  \"content\": $(echo "$FULL_PROMPT" | jq -Rs .)
-                }
-              ],
-              \"temperature\": 0.3,
-              \"max_tokens\": 3000
-            }")
+            --data @request.json \
+            https://models.inference.ai.azure.com/chat/completions)
           
-          # Check for errors
-          if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
-            echo "❌ API Error: $(echo "$RESPONSE" | jq -r '.error.message')"
+          # Extract HTTP status code and body
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "📡 HTTP Status: $HTTP_CODE"
+          
+          # Validate response
+          if [ -z "$RESPONSE_BODY" ]; then
+            echo "❌ Empty response from API"
+            echo "HTTP Code: $HTTP_CODE"
+            exit 1
+          fi
+          
+          # Check HTTP status
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ API request failed with HTTP $HTTP_CODE"
+            echo "Response: $RESPONSE_BODY"
+            exit 1
+          fi
+          
+          # Check for API errors
+          if echo "$RESPONSE_BODY" | jq -e '.error' > /dev/null 2>&1; then
+            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error.message // "Unknown error"')
+            ERROR_CODE=$(echo "$RESPONSE_BODY" | jq -r '.error.code // "unknown"')
+            echo "❌ API Error [$ERROR_CODE]: ${ERROR_MSG}"
+            echo "Full response: $RESPONSE_BODY"
+            exit 1
+          fi
+          
+          # Validate response structure and extract content
+          if ! echo "$RESPONSE_BODY" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            echo "❌ Invalid response structure - missing expected content field"
+            echo "Response: $RESPONSE_BODY"
             exit 1
           fi
           
           # Extract updated documentation
-          echo "$RESPONSE" | jq -r '.choices[0].message.content' > updated_docs.md
+          echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content' > updated_docs.md
           
-          echo "✅ Documentation updates generated"
+          if [ ! -s updated_docs.md ]; then
+            echo "❌ Generated documentation is empty"
+            exit 1
+          fi
+          
+          echo "✅ Documentation updates generated ($(wc -l < updated_docs.md) lines)"
 
       - name: Apply documentation updates
         if: steps.analyze-changes.outputs.change_count > 0
@@ -256,10 +309,28 @@ jobs:
           
           git commit -F commit_message.txt
           
-          # Push changes
-          git push origin ${{ github.ref_name }}
+          # Push changes with retry logic (handles race conditions)
+          echo "📤 Pushing changes..."
+          MAX_RETRIES=3
+          RETRY_COUNT=0
           
-          echo "✅ Documentation updates pushed successfully"
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git push origin ${{ github.ref_name }}; then
+              echo "✅ Documentation updates pushed successfully"
+              break
+            else
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⚠️  Push failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
+                sleep 2
+                # Pull and rebase before retry
+                git pull --rebase origin ${{ github.ref_name }} || true
+              else
+                echo "❌ Push failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+          done
 
       - name: Create summary comment
         if: steps.apply-updates.outputs.has_changes == 'true'
